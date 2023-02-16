@@ -7,12 +7,203 @@ terraform {
   }
 }
 
-# Configure the AWS Provider
-provider "aws" {
-    region="us-west-2"
-    access_key = "AKIA6AK5B2HLSMH5G2GD"
-    secret_key = "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"
+# Create the IAM roles: Create the IAM roles that are required to allow the code pipeline
+resource "aws_iam_role" "codepipeline_role" {
+  name = "${var.pipeline_name}-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "codepipeline.amazonaws.com"
+        }
+      }
+    ]
+  })
 }
+
+
+#Create Policy for the role to have acccess
+resource "aws_iam_role_policy_attachment" "pipeline_policy_attachment" {
+  policy_arn = "arn:aws:iam::aws:policy/AWSCodePipelineFullAccess"
+  role       = aws_iam_role.codepipeline_role.name
+}
+
+resource "aws_iam_policy" "codebuild_policy" {
+  name = "codebuild_policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:PutObjectAcl"]
+        Resource = ["arn:aws:s3:::my-bucket/*"]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codebuild_policy_attachment" {
+  policy_arn = aws_iam_policy.codebuild_policy.arn
+  role       = aws_iam_role.codepipeline_role.name
+}
+#Create secrete manager to store 
+
+resource "aws_secretsmanager_secret" "github_token_secret" {
+  name = "github-token-secret"
+
+  tags = {
+    Environment = "production"
+  }
+}
+
+# aws_secretsmanager_secret_version that retrieves the secret value from AWS Secrets Manager 
+# using the secret_id specified in the var.github_token_secret_id variable.
+# create secrete version 
+
+resource "aws_secretsmanager_secret_version" "github_token_secret_version" {
+  secret_id     = aws_secretsmanager_secret.github_token_secret.id
+  secret_string = var.github_token
+  # NOTE : This github_token need to be passing in as commandline when we run terraform
+}
+
+#create code pipeline
+resource "aws_codepipeline" "pipeline" {
+  name     = var.pipeline_name
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    location = "pipeline-artifacts-${var.aws_region}"
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name     = "Source"
+      category = "Source"
+      owner    = "ThirdParty"
+      provider = "GitHub"
+      version  = "1"
+
+      configuration = {
+        Owner      = "<OWNER>"
+        Repo       = var.github_repo_name
+        Branch     = "master"
+        OAuthToken = data.aws_secretsmanager_secret_version.github_token.secret_string
+      }
+
+      output_artifacts = ["SourceOutput"]
+    }
+  }
+
+  stage {
+    name = "Build"
+    action {
+      name     = "BuildAction"
+      category = "Build"
+      owner    = "AWS"
+      provider = "CodeBuild"
+      version  = "1"
+      configuration = {
+        ProjectName = aws_codebuild_project.build_project.name
+      }
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["build_output"]
+    }
+  }
+  stage {
+    name = "Deploy"
+    action {
+      name     = "DeployAction"
+      category = "Deploy"
+      owner    = "AWS"
+      provider = "ECR"
+      version  = "1"
+      configuration = {
+        RepositoryName = aws_ecr_repository.ecr_repo.name
+        ImageTag       = "latest"
+      }
+      input_artifacts = ["build_output"]
+      run_order       = 1
+      role_arn        = aws_iam_role.codepipeline_role.arn
+      run_command = join("", [
+        data.aws_ecr_get_login_command.ecr_login_command.execution_arn, " | sh"
+      ])
+    }
+  }
+
+  artifact_store {
+    type       = "S3"
+    location   = aws_s3_bucket.pipeline_artifacts.bucket
+    encryption = true
+  }
+}
+
+
+
+
+#create a repository
+resource "aws_ecr_repository" "my_repository" {
+  name = var.ecr_repository_name
+}
+
+# Build and push the Docker image to ECR
+resource "aws_ecr_registry_image" "my_image" {
+  image_name = "${aws_ecr_repository.my_repository.repository_url}:latest"
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+  }
+}
+# Output the ECR repository URL
+output "ecr_repository_url" {
+  value = aws_ecr_repository.my_repository.repository_url
+}
+
+#Code build 
+#define a build project
+resource "aws_codebuild_project" "build_project" {
+  name         = "${var.pipeline_name}-build"
+  service_role = aws_iam_role.codepipeline_role.arn
+
+  source {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type = "BUILD_GENERAL1_SMALL"
+    image        = "aws/codebuild/docker:1.12.1"
+    type         = "LINUX_CONTAINER"
+
+    environment_variable {
+      name  = "DOCKERFILE_NAME"
+      value = var.dockerfile_name
+    }
+  }
+
+  build {
+    commands = [
+      "docker build -t myimage . -f $DOCKERFILE_NAME",
+      "docker tag myimage:latest <AWS_ACCOUNT_ID>.dkr.ecr.${var.aws_region}.amazonaws.com/myimage:latest",
+      "$(aws ecr get-login --region ${var.aws_region} --no-include-email)",
+      # Tag the Docker image with the ECR repository URI
+      "docker tag my-image ${ecr_repository_url}:latest",
+      # Push the Docker image to the ECR repository
+      "docker push ${ecr_repository_url}:latest"
+      //"docker push <AWS_ACCOUNT_ID>.dkr.ecr.${var.aws_region}.amazonaws.com/myimage:latest"
+    ]
+  }
+}
+
+
+
+/*
 
 resource "aws_ecr_repository" "group2_c1_ch_first_ecr_repo" {
   name = "group2-c1-ch-first-ecr-repo" # Naming my repository
@@ -181,3 +372,4 @@ resource "aws_lb_listener" "listener" {
   }
 }
            
+*/
